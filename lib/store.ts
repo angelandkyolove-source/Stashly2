@@ -15,11 +15,12 @@ export type Post = {
   createdAt: number;
   saves: number;
   author?: string; // 公開用の作者ID（pidOf(uid)）
+  hidden?: boolean; // 通報が一定数に達して非表示になった投稿
 };
 
 const redisUrl = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
 const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
-const redis = redisUrl && redisToken ? new Redis({ url: redisUrl, token: redisToken }) : null;
+export const redis = redisUrl && redisToken ? new Redis({ url: redisUrl, token: redisToken }) : null;
 const blobEnabled = !!process.env.BLOB_READ_WRITE_TOKEN;
 
 export type Collection = { id: string; name: string };
@@ -28,18 +29,19 @@ export { MAX_COLLECTIONS };
 export const isLocalMode = !redis || !blobEnabled;
 
 /* ---------- ローカル(開発用)ストア ---------- */
-type Local = { posts: Post[]; saved: Record<string, string[] | Record<string, string[]>>; cols?: Record<string, Collection[]>;
-  names?: Record<string, string>; following?: Record<string, string[]> };
+export type Local = { posts: Post[]; saved: Record<string, string[] | Record<string, string[]>>; cols?: Record<string, Collection[]>;
+  names?: Record<string, string>; following?: Record<string, string[]>;
+  kv?: Record<string, { v: unknown; exp?: number }> };
 const FILE = path.join(process.cwd(), ".data", "db.json");
 
-async function readLocal(): Promise<Local> {
+export async function readLocal(): Promise<Local> {
   try {
     return JSON.parse(await fs.readFile(FILE, "utf8"));
   } catch {
     return { posts: [], saved: {} };
   }
 }
-async function writeLocal(d: Local) {
+export async function writeLocal(d: Local) {
   await fs.mkdir(path.dirname(FILE), { recursive: true });
   await fs.writeFile(FILE, JSON.stringify(d));
 }
@@ -52,9 +54,9 @@ export async function listPosts(): Promise<Post[]> {
     const ids = await redis.zrange<string[]>("posts", 0, MAX_SCAN - 1, { rev: true });
     if (!ids.length) return [];
     const rows = await redis.mget<(Post | null)[]>(...ids.map((i) => `post:${i}`));
-    return rows.filter((r): r is Post => !!r);
+    return rows.filter((r): r is Post => !!r && !r.hidden);
   }
-  return (await readLocal()).posts.sort((a, b) => b.createdAt - a.createdAt);
+  return (await readLocal()).posts.filter((p) => !p.hidden).sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export async function getPost(id: string): Promise<Post | null> {
@@ -275,6 +277,59 @@ export async function toggleFollow(uid: string, pid: string): Promise<boolean | 
   else list.push(pid);
   await writeLocal(d);
   return i < 0;
+}
+
+/* ---------- 運営・アカウント用 ---------- */
+/** 作者の全投稿（非表示を含む）。アカウント削除で使う */
+export async function postsByAuthor(pid: string): Promise<Post[]> {
+  if (redis) {
+    const ids = await redis.zrange<string[]>("posts", 0, -1, { rev: true });
+    if (!ids.length) return [];
+    const rows = await redis.mget<(Post | null)[]>(...ids.map((i) => `post:${i}`));
+    return rows.filter((r): r is Post => !!r && r.author === pid);
+  }
+  return (await readLocal()).posts.filter((p) => p.author === pid);
+}
+
+export async function patchPost(id: string, patch: Partial<Post>): Promise<void> {
+  if (redis) {
+    const post = await redis.get<Post>(`post:${id}`);
+    if (post) await redis.set(`post:${id}`, { ...post, ...patch });
+    return;
+  }
+  const d = await readLocal();
+  d.posts = d.posts.map((p) => (p.id === id ? { ...p, ...patch } : p));
+  await writeLocal(d);
+}
+
+/** この作者をフォローしている人のuid一覧 */
+export async function followersOf(pid: string): Promise<string[]> {
+  if (redis) return redis.smembers(`followers:${pid}`);
+  return Object.entries((await readLocal()).following ?? {}).filter(([, l]) => l.includes(pid)).map(([u]) => u);
+}
+
+/** 利用者の保存・コレクション・フォロー・名前・投稿をすべて消す（アカウント削除用） */
+export async function purgeUserData(uid: string): Promise<void> {
+  const pid = pidOf(uid);
+  for (const p of await postsByAuthor(pid)) await deletePost(uid, p.id);
+
+  const cols = (redis ? await redis.get<Collection[]>(`cols:${uid}`) : (await readLocal()).cols?.[uid]) ?? [];
+  for (const c of cols) {
+    for (const postId of await collectionIds(uid, c.id)) await toggleSave(uid, c.id, postId);
+    if (redis) await redis.del(skey(uid, c.id));
+  }
+  for (const f of await getFollowing(uid)) await toggleFollow(uid, f);
+  for (const fu of await followersOf(pid)) await toggleFollow(fu, pid);
+
+  if (redis) await redis.del(`cols:${uid}`, `pname:${pid}`, `following:${uid}`, `followers:${pid}`);
+  else {
+    const d = await readLocal();
+    delete d.cols?.[uid];
+    delete d.names?.[pid];
+    delete d.saved[uid];
+    delete d.following?.[uid];
+    await writeLocal(d);
+  }
 }
 
 export function matches(p: Post, q: string): boolean {
